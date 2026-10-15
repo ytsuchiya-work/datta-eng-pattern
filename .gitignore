@@ -218,3 +218,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- data-eng-pattern ---
+node_modules/
+app/static/
+.claude/
+.DS_Store
+# ローカル用の CLI ラッパー（プロファイル名を含む）
+dbx

@@ -1,0 +1,14 @@
+command: ["python", "server.py"]
+env:
+  - name: WAREHOUSE_ID
+    valueFrom: sql-warehouse
+  - name: CATALOG
+    value: classic_stable_ytcy_catalog
+  - name: SCHEMA
+    value: data_eng_pattern
+  - name: OWNER_USER  # ジョブとフォルダに CAN_MANAGE を付けるユーザー（メールアドレス）。空なら付けない
+    value: ""
+  - name: AUTO_OFF_MIN
+    value: "30"
+  - name: STREAM_MIN
+    value: "10"

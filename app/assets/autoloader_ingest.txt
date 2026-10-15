@@ -1,0 +1,82 @@
+# Databricks notebook source
+# MAGIC %md
+# MAGIC # Auto Loader: landing → bronze
+# MAGIC データ取り込みパターン・エクスプローラ（Databricks App）がジョブから呼び出すノートブック。
+# MAGIC - `mode=batch`  : `trigger(availableNow=True)` で未処理ファイルだけを取り込んで終了する（手動・スケジュール・ファイル到着・テーブル更新トリガー）
+# MAGIC - `mode=stream` : 常時起動して数秒ごとにマイクロバッチを処理し、各バッチで silver への反映まで行う（Streaming）
+# MAGIC
+# MAGIC 処理済みファイルはチェックポイントが記録するので、同じファイルを二度取り込むことはない。
+
+# COMMAND ----------
+
+import time
+
+from pyspark.sql import functions as F
+
+dbutils.widgets.text("pattern", "al_append")
+dbutils.widgets.text("mode", "batch")
+dbutils.widgets.text("catalog", "classic_stable_ytcy_catalog")
+dbutils.widgets.text("schema", "data_eng_pattern")
+dbutils.widgets.text("duration_min", "10")
+dbutils.widgets.text("interval_sec", "10")
+dbutils.widgets.text("silver_sql", "")
+
+PATTERN = dbutils.widgets.get("pattern")
+MODE = dbutils.widgets.get("mode")
+C, S = dbutils.widgets.get("catalog"), dbutils.widgets.get("schema")
+DURATION_SEC = int(dbutils.widgets.get("duration_min")) * 60
+INTERVAL_SEC = int(dbutils.widgets.get("interval_sec"))
+
+SOURCE = f"/Volumes/{C}/{S}/landing/{PATTERN}/"
+CHECKPOINT = f"/Volumes/{C}/{S}/checkpoints/{PATTERN}/"
+BRONZE = f"{C}.{S}.{PATTERN}_bronze"
+SCHEMA = ("order_id INT, customer STRING, item STRING, qty INT, amount DOUBLE, status STRING, "
+          "updated_at TIMESTAMP, _op STRING, _seq BIGINT")
+
+# bronze → silver の SQL（ジョブの apply_silver タスクと同じファイル）
+SILVER_STATEMENTS = []
+if MODE == "stream":
+    text = open(dbutils.widgets.get("silver_sql")).read()
+    body = "\n".join(l for l in text.splitlines() if not l.strip().startswith("--"))
+    SILVER_STATEMENTS = [s for s in body.split(";") if s.strip()]
+
+# COMMAND ----------
+
+def read_landing():
+    return (spark.readStream.format("cloudFiles")
+            .option("cloudFiles.format", "json")
+            .schema(SCHEMA)
+            .load(SOURCE)
+            .select("*", F.col("_metadata.file_name").alias("_file"),
+                    F.current_timestamp().alias("_ingested_at")))
+
+
+def write_batch(batch_df, batch_id):
+    batch_df.write.mode("append").saveAsTable(BRONZE)
+    for stmt in SILVER_STATEMENTS:  # Streaming 時はマイクロバッチごとに silver まで反映
+        batch_df.sparkSession.sql(stmt)
+
+
+def start(**trigger):
+    return (read_landing().writeStream
+            .foreachBatch(write_batch)
+            .option("checkpointLocation", CHECKPOINT)
+            .trigger(**trigger)
+            .start())
+
+# COMMAND ----------
+
+if MODE == "batch":
+    start(availableNow=True).awaitTermination()
+else:
+    deadline = time.time() + DURATION_SEC
+    try:
+        q = start(processingTime=f"{INTERVAL_SEC} seconds")
+        q.awaitTermination(DURATION_SEC)
+        q.stop()
+    except Exception as e:
+        # サーバーレスは processingTime トリガー非対応 → availableNow を一定間隔で繰り返して常時処理する
+        print("processingTime not available:", str(e)[:200])
+        while time.time() < deadline:
+            start(availableNow=True).awaitTermination()
+            time.sleep(INTERVAL_SEC)
